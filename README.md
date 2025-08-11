@@ -2,7 +2,7 @@ Everyone in their life at a certain point needed a mapping library.
 Every mapping library is a mess to deal with, this is also a mess, but less.
 
 This library was born to meet our needs to have asyncronus DI compatible mappings.
-
+Have been using this for a while, publishing to the recent AutoMapper developments (v15 commercial licensing)
 
 
 ## Features
