@@ -13,9 +13,10 @@ Everything you need from you mapper plus:
 
 ## Usage
 
-The project demonstrates how to configure the DI container to register the `MegaMapper` and your custom mapping profiles or builders.
-
-Example of configuring DI in tests or your application:
+Install with the following command from nuget:
+```
+dotnet add package MegaMapper --version 1.0.0
+```
 
 ```csharp
 var services = new ServiceCollection();
