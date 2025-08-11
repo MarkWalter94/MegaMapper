@@ -33,8 +33,8 @@ public class MegaMapper : IMegaMapper
 
     public MegaMapper(IEnumerable<IMegaMapperProfile> profiles, IEnumerable<IMegaMapperMapBuilder> builders)
     {
-        _profiles.AddRange(profiles);
         _profiles.AddRange(builders.Select(x => x.BuildProfile()));
+        _profiles.AddRange(profiles);
     }
 
     public async Task<TOut> Map<TOut>(object input)

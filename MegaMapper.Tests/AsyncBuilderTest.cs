@@ -6,13 +6,13 @@ using Xunit;
 
 namespace MegaMapper.Examples;
 
-public class AdvancedTests
+public class AsyncBuilderTest
 {
     private readonly ServiceProvider _provider;
     private readonly IMegaMapper _mapper;
     private readonly ICustomService _customService;
 
-    public AdvancedTests()
+    public AsyncBuilderTest()
     {
         var services = new ServiceCollection();
         services.AddMegaMapper();
@@ -24,7 +24,7 @@ public class AdvancedTests
         //Order matters, maps are applied in order!
         //If any of the maps has the property UseBaseMap, then first the base map will be applied.
         services.AddMegaMapperBuilder<UserComplexToUserComplexDtoMapBuilder>();
-        services.AddMegaMapperBuilder<AdvancedMappingProfile>();
+        services.AddMegaMapperBuilder<AdvancedMappingBuilder>();
 
         _provider = services.BuildServiceProvider();
         _mapper = _provider.GetRequiredService<IMegaMapper>();
@@ -32,7 +32,7 @@ public class AdvancedTests
     }
 
     [Fact]
-    public async Task AdvancedMappingTest()
+    public async Task AdvancedMappingBuilderTest()
     {
         var user = new UserComplex
         {

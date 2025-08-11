@@ -1,20 +1,23 @@
 ﻿using MegaMapper.Examples.Dto;
 using MegaMapper.Examples.Services;
-using Xunit.Sdk;
 
 namespace MegaMapper.Examples.Profiles;
 
-public class AdvancedMappingProfile : MegaMapperMapBuilder<UserComplex, UserComplexDto>
+public class AdvancedMappingProfile : MegaMapperProfile<UserComplex, UserComplexDto>
 {
     private readonly ICustomService _customService;
-
-    //Every property is map with the base core mapping, then overrided with the properties defined here.
-    public override bool UseBaseMap => true;
-
     public AdvancedMappingProfile(ICustomService customService)
     {
         _customService = customService;
+    }
+    protected override async Task<UserComplexDto> Map(UserComplex input, UserComplexDto output)
+    {
+        output.FirstName = await _customService.GetTheData();
+        return output;
+    }
 
-        MapField<string, string>(x => x.FirstName, y => y.FirstName, async (a, b, c) => await _customService.GetTheData());
+    protected override Task<UserComplex> MapBack(UserComplexDto input, UserComplex output)
+    {
+        return Task.FromResult(output);
     }
 }
