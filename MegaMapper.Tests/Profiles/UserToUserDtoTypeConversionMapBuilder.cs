@@ -2,7 +2,7 @@
 
 namespace MegaMapper.Examples.Profiles;
 
-public class UserToUserDtoTypeConversionMapBuilder : MegaMapperMapBuilder<User, UserDto>
+public class UserToUserDtoTypeConversionMapBuilder : MegaMapperMapBuilder<UserConversion, UserDtoConversion>
 {
     public UserToUserDtoTypeConversionMapBuilder()
     {

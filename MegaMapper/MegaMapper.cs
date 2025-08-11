@@ -58,21 +58,62 @@ public class MegaMapper : IMegaMapper
         if (mappedObjects.TryGetValue(input, out var existingMapped))
             return existingMapped;
 
-        var matchedProfile = _profiles.FirstOrDefault(mapperProfile =>
-            mapperProfile.GetTIn() == input.GetType() && mapperProfile.GetTOut() == outputType);
+        var matchedProfiles = _profiles.Where(mapperProfile =>
+            mapperProfile.GetTIn() == input.GetType() && mapperProfile.GetTOut() == outputType).ToList();
 
         //If there is a profile use it.
-        if (matchedProfile != null)
-            return await matchedProfile.MapInternal(input);
+        if (matchedProfiles.Count != 0)
+        {
+            var useBaseMap = matchedProfiles.Any(x => x.UseBaseMap);
+            object? pass = null;
+            if (useBaseMap)
+            {
+                pass = (await AutoMap(outputType, input, mappedObjects))!;
+            }
 
+            foreach (var matchedProfile in matchedProfiles)
+            {
+                if (pass != null)
+                    pass = await matchedProfile.MapInternal(input, pass);
+                else
+                    pass = await matchedProfile.MapInternal(input);
+            }
 
-        var inverseProfile = _profiles.FirstOrDefault(mapperProfile =>
-            mapperProfile.GetTIn() == outputType && mapperProfile.GetTOut() == input.GetType());
+            return pass;
+        }
+
+        var inverseProfiles = _profiles.Where(mapperProfile =>
+            mapperProfile.GetTIn() == outputType && mapperProfile.GetTOut() == input.GetType()).ToList();
 
         // If there is a inverse profile use it.
-        if (inverseProfile != null)
-            return await inverseProfile.MapBackInternal(input);
+        if (inverseProfiles.Count > 0)
+        {
+            var useBaseMap = inverseProfiles.Any(x => x.UseBaseMap);
 
+            object? pass = null;
+            if (useBaseMap)
+            {
+                pass = (await AutoMap(outputType, input, mappedObjects))!;
+            }
+
+            foreach (var inverseProfile in inverseProfiles)
+            {
+                if (pass != null)
+                    pass = await inverseProfile.MapBackInternal(input, pass);
+                else
+                    pass = await inverseProfile.MapBackInternal(input);
+            }
+
+            return pass;
+        }
+
+        return await AutoMap(outputType, input, mappedObjects);
+    }
+
+    private async Task<object?> AutoMap(Type outputType, object? input, Dictionary<object, object?>? mappedObjects = null)
+    {
+        if (input == null)
+            return null;
         // Mapping for enumerables.
         if (typeof(IEnumerable).IsAssignableFrom(outputType) && input is IEnumerable inputEnumerable)
         {
@@ -94,51 +135,51 @@ public class MegaMapper : IMegaMapper
 
         // Base map for non mapped types.
         var output = Activator.CreateInstance(outputType);
-        mappedObjects[input] = output;
+        mappedObjects![input] = output;
 
         var inputProperties = GetOrAddProperties(input.GetType());
         var outputProperties = GetOrAddProperties(outputType);
 
         foreach (var inProperty in inputProperties.Values)
         {
-                if (!inProperty.CanRead) continue;
-                if (!outputProperties.TryGetValue(inProperty.Name.ToLower(), out var outProperty)) continue;
-                if (!outProperty.CanWrite) continue;
+            if (!inProperty.CanRead) continue;
+            if (!outputProperties.TryGetValue(inProperty.Name.ToLower(), out var outProperty)) continue;
+            if (!outProperty.CanWrite) continue;
 
-                var value = inProperty.GetValue(input);
-                if (value == null)
-                {
-                    outProperty.SetValue(output, null);
-                    continue;
-                }
+            var value = inProperty.GetValue(input);
+            if (value == null)
+            {
+                outProperty.SetValue(output, null);
+                continue;
+            }
 
-                // If same type
-                if (outProperty.PropertyType == inProperty.PropertyType)
-                {
-                    outProperty.SetValue(output, value);
-                    continue;
-                }
+            // If same type
+            if (outProperty.PropertyType == inProperty.PropertyType)
+            {
+                outProperty.SetValue(output, value);
+                continue;
+            }
 
-                // Nullable ↔ non nullable
-                var targetType = Nullable.GetUnderlyingType(outProperty.PropertyType) ?? outProperty.PropertyType;
-                var sourceType = Nullable.GetUnderlyingType(inProperty.PropertyType) ?? inProperty.PropertyType;
+            // Nullable ↔ non nullable
+            var targetType = Nullable.GetUnderlyingType(outProperty.PropertyType) ?? outProperty.PropertyType;
+            var sourceType = Nullable.GetUnderlyingType(inProperty.PropertyType) ?? inProperty.PropertyType;
 
-                if (targetType == sourceType)
-                {
-                    // Same underlying type
-                    outProperty.SetValue(output, Convert.ChangeType(value, targetType));
-                    continue;
-                }
+            if (targetType == sourceType)
+            {
+                // Same underlying type
+                outProperty.SetValue(output, Convert.ChangeType(value, targetType));
+                continue;
+            }
 
-                // Convertible types
-                if (targetType.IsAssignableFrom(sourceType) || typeof(IConvertible).IsAssignableFrom(targetType))
-                {
-                    outProperty.SetValue(output, Convert.ChangeType(value, targetType));
-                    continue;
-                }
+            // Convertible types
+            if (targetType.IsAssignableFrom(sourceType) || typeof(IConvertible).IsAssignableFrom(targetType))
+            {
+                outProperty.SetValue(output, Convert.ChangeType(value, targetType));
+                continue;
+            }
 
-                // Recurring mapping if none of these
-                outProperty.SetValue(output, await Map(outProperty.PropertyType, value, mappedObjects));
+            // Recurring mapping if none of these
+            outProperty.SetValue(output, await Map(outProperty.PropertyType, value, mappedObjects));
         }
 
         return output;

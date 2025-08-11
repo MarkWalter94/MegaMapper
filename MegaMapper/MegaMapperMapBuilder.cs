@@ -17,6 +17,10 @@ public interface IMegaMapperMapBuilder
 /// <typeparam name="TDest"></typeparam>
 public abstract class MegaMapperMapBuilder<TSrc, TDest> : IMegaMapperMapBuilder
 {
+    /// <summary>
+    /// If set to true, the mapper applies the base standard map before applying the custom maps.
+    /// </summary>
+    public virtual bool UseBaseMap { get; protected set; }
     internal List<IPropertyMap<TSrc, TDest>> Maps { get; } = new();
     internal List<IPropertyMap<TDest, TSrc>> ReverseMaps { get; } = new();
 
@@ -168,6 +172,9 @@ public abstract class MegaMapperMapBuilder<TSrc, TDest> : IMegaMapperMapBuilder
     /// <returns></returns>
     public IMegaMapperProfile BuildProfile()
     {
-        return new MegaMapperInternalProfile<TSrc, TDest>(this);
+        return new MegaMapperInternalProfile<TSrc, TDest>(this)
+        {
+            UseBaseMap = UseBaseMap
+        };
     }
 }

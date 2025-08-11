@@ -10,6 +10,11 @@ public interface IMegaMapperProfile
     Task<object> MapInternal(object input, object output);
     Task<object> MapBackInternal(object input);
     Task<object> MapBackInternal(object input, object output);
+
+    /// <summary>
+    /// If set to true, the mapper applies the base standard map before applying the custom maps.
+    /// </summary>
+    public bool UseBaseMap { get; protected set; }
 }
 
 public abstract class MegaMapperProfile<TIn, TOut> : IMegaMapperProfile
@@ -51,6 +56,9 @@ public abstract class MegaMapperProfile<TIn, TOut> : IMegaMapperProfile
     {
         return (await MapBack((TOut)input, (TIn)output))!;
     }
+
+    /// <inheritdoc/>
+    public bool UseBaseMap { get; set; }
 
     /// <summary>
     /// Funzione di mapping da TIn a TOut.
