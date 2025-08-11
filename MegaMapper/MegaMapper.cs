@@ -101,17 +101,44 @@ public class MegaMapper : IMegaMapper
 
         foreach (var inProperty in inputProperties.Values)
         {
-            if (!inProperty.CanRead) continue;
-            if (!outputProperties.TryGetValue(inProperty.Name.ToLower(), out var outProperty)) continue;
-            if (!outProperty.CanWrite) continue;
+                if (!inProperty.CanRead) continue;
+                if (!outputProperties.TryGetValue(inProperty.Name.ToLower(), out var outProperty)) continue;
+                if (!outProperty.CanWrite) continue;
 
-            var value = inProperty.GetValue(input);
-            if (outProperty.PropertyType == inProperty.PropertyType || value == null)
-                outProperty.SetValue(output, value);
-            else
-            {
+                var value = inProperty.GetValue(input);
+                if (value == null)
+                {
+                    outProperty.SetValue(output, null);
+                    continue;
+                }
+
+                // If same type
+                if (outProperty.PropertyType == inProperty.PropertyType)
+                {
+                    outProperty.SetValue(output, value);
+                    continue;
+                }
+
+                // Nullable ↔ non nullable
+                var targetType = Nullable.GetUnderlyingType(outProperty.PropertyType) ?? outProperty.PropertyType;
+                var sourceType = Nullable.GetUnderlyingType(inProperty.PropertyType) ?? inProperty.PropertyType;
+
+                if (targetType == sourceType)
+                {
+                    // Same underlying type
+                    outProperty.SetValue(output, Convert.ChangeType(value, targetType));
+                    continue;
+                }
+
+                // Convertible types
+                if (targetType.IsAssignableFrom(sourceType) || typeof(IConvertible).IsAssignableFrom(targetType))
+                {
+                    outProperty.SetValue(output, Convert.ChangeType(value, targetType));
+                    continue;
+                }
+
+                // Recurring mapping if none of these
                 outProperty.SetValue(output, await Map(outProperty.PropertyType, value, mappedObjects));
-            }
         }
 
         return output;
@@ -124,7 +151,7 @@ public class MegaMapper : IMegaMapper
     }
 
     /// <summary>
-    /// Ritorna se già esistenti o aggiunge alla cache le properties di un tipo.
+    /// Get or add cached properties references.
     /// </summary>
     /// <param name="type"></param>
     /// <returns></returns>

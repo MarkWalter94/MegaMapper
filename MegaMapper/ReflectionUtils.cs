@@ -6,9 +6,8 @@ namespace MegaMapper;
 /// <summary>
 /// Reflection for lambdas
 /// </summary>
- public static class ReflectionHelper
+public static class ReflectionHelper
 {
-    
     /// <summary>
     /// Extracts the <see cref="MemberInfo"/> from a lambda expression like <c>x => x.Property</c> or <c>x => x.Nested.Property</c>.
     /// Handles optional conversions (e.g., casts to object).
@@ -38,8 +37,8 @@ namespace MegaMapper;
             $"Expression '{lambdaExpression}' must refer to a field or property (e.g., x => x.Property or x => x.Nested.Property).",
             nameof(lambdaExpression));
     }
-    
-    
+
+
     /// <summary>
     /// Sets the value of a property or field represented by a <see cref="MemberInfo"/> on the specified target object.
     /// </summary>
@@ -67,7 +66,7 @@ namespace MegaMapper;
                 nameof(propertyOrField));
         }
     }
-    
+
     /// <summary>
     /// Gets the value of a property or field represented by a <see cref="MemberInfo"/> from the specified target object.
     /// </summary>
@@ -92,5 +91,4 @@ namespace MegaMapper;
                 nameof(propertyOrField));
         }
     }
-
 }
