@@ -1,5 +1,6 @@
 ﻿using System.Collections;
 using System.Collections.Concurrent;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
@@ -29,12 +30,31 @@ public class MegaMapper : IMegaMapper
 {
     // Cache for the properties of each type
     private static readonly ConcurrentDictionary<Type, Dictionary<string, PropertyInfo>> _propertiesCache = new();
-    private readonly List<IMegaMapperProfile> _profiles = new();
+    private readonly Dictionary<Tuple<Type, Type>, List<IMegaMapperProfile>> _profiles = new();
+    private static readonly ConcurrentDictionary<Type, Func<object>> _ctorCache = new();
+    private static readonly ConcurrentDictionary<(Type, Type), bool> _assignableCache = new();
+    private static readonly ConcurrentDictionary<Type, bool> _convertibleCache = new();
 
-    public MegaMapper(IEnumerable<IMegaMapperProfile> profiles, IEnumerable<IMegaMapperMapBuilder> builders)
+    // private static readonly Stopwatch _sw = new();
+    // private long _elapsed;
+
+    private static object CreateInstance(Type type)
     {
-        _profiles.AddRange(builders.Select(x => x.BuildProfile()));
-        _profiles.AddRange(profiles);
+        return _ctorCache.GetOrAdd(type, t => Expression.Lambda<Func<object>>(Expression.New(t)).Compile())();
+    }
+
+    public MegaMapper(IEnumerable<IMegaMapperProfile> inputProfiles, IEnumerable<IMegaMapperMapBuilder> builders)
+    {
+        var profiles = builders.Select(x => x.BuildProfile()).ToList();
+        profiles.AddRange(inputProfiles);
+
+        foreach (var profile in profiles)
+        {
+            if (_profiles.TryGetValue(new Tuple<Type, Type>(profile.GetTIn(), profile.GetTOut()), out var properties))
+                properties.Add(profile);
+            else
+                _profiles[new Tuple<Type, Type>(profile.GetTIn(), profile.GetTOut())] = [profile];
+        }
     }
 
     public async Task<TOut> Map<TOut>(object input)
@@ -47,22 +67,21 @@ public class MegaMapper : IMegaMapper
         return await Map<TOut>(input!);
     }
 
-    private async Task<object?> Map(Type outputType, object? input, Dictionary<object, object?>? mappedObjects = null)
+    private async Task<object?> Map(Type outputType, object? input)
+    {
+        return await Map(outputType, input, new Dictionary<object, object?>(new ReferenceEqualityComparer()));
+    }
+
+
+    private async Task<object?> Map(Type outputType, object? input, Dictionary<object, object?> mappedObjects)
     {
         if (input == null)
             return null;
 
-        //For recurring objects and cycles.
-        mappedObjects ??= new Dictionary<object, object?>(new ReferenceEqualityComparer());
-
         if (mappedObjects.TryGetValue(input, out var existingMapped))
             return existingMapped;
-
-        var matchedProfiles = _profiles.Where(mapperProfile =>
-            mapperProfile.GetTIn() == input.GetType() && mapperProfile.GetTOut() == outputType).ToList();
-
-        //If there is a profile use it.
-        if (matchedProfiles.Count != 0)
+        
+        if (_profiles.TryGetValue(new Tuple<Type, Type>(input.GetType(), outputType), out var matchedProfiles) && matchedProfiles.Count != 0)
         {
             var useBaseMap = matchedProfiles.Any(x => x.UseBaseMap);
             object? pass = null;
@@ -81,12 +100,8 @@ public class MegaMapper : IMegaMapper
 
             return pass;
         }
-
-        var inverseProfiles = _profiles.Where(mapperProfile =>
-            mapperProfile.GetTIn() == outputType && mapperProfile.GetTOut() == input.GetType()).ToList();
-
-        // If there is a inverse profile use it.
-        if (inverseProfiles.Count > 0)
+        
+        if (_profiles.TryGetValue(new Tuple<Type, Type>(outputType, input.GetType()), out var inverseProfiles) && inverseProfiles.Count > 0)
         {
             var useBaseMap = inverseProfiles.Any(x => x.UseBaseMap);
 
@@ -110,18 +125,20 @@ public class MegaMapper : IMegaMapper
         return await AutoMap(outputType, input, mappedObjects);
     }
 
-    private async Task<object?> AutoMap(Type outputType, object? input, Dictionary<object, object?>? mappedObjects = null)
+    private async Task<object?> AutoMap(Type outputType, object? input, Dictionary<object, object?> mappedObjects)
     {
         if (input == null)
             return null;
-        // Mapping for enumerables.
-        if (typeof(IEnumerable).IsAssignableFrom(outputType) && input is IEnumerable inputEnumerable)
+        
+        var res3 = typeof(IEnumerable).IsAssignableFrom(outputType);
+
+        if (res3 && input is IEnumerable inputEnumerable)
         {
             var outElementType = outputType.IsGenericType
                 ? outputType.GetGenericArguments()[0]
                 : typeof(object); // fallback if non generic
 
-            var resultList = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(outElementType))!;
+            var resultList = (IList)CreateInstance(typeof(List<>).MakeGenericType(outElementType));
 
             foreach (var item in inputEnumerable)
             {
@@ -131,11 +148,9 @@ public class MegaMapper : IMegaMapper
 
             return resultList;
         }
-
-
-        // Base map for non mapped types.
-        var output = Activator.CreateInstance(outputType);
-        mappedObjects![input] = output;
+        
+        var output = CreateInstance(outputType);
+        mappedObjects[input] = output;
 
         var inputProperties = GetOrAddProperties(input.GetType());
         var outputProperties = GetOrAddProperties(outputType);
@@ -143,24 +158,22 @@ public class MegaMapper : IMegaMapper
         foreach (var inProperty in inputProperties.Values)
         {
             if (!inProperty.CanRead) continue;
-            if (!outputProperties.TryGetValue(inProperty.Name.ToLower(), out var outProperty)) continue;
+            if (!outputProperties.TryGetValue(inProperty.Name, out var outProperty)) continue;
             if (!outProperty.CanWrite) continue;
 
             var value = inProperty.GetValue(input);
+
             if (value == null)
             {
                 outProperty.SetValue(output, null);
                 continue;
             }
-
-            // If same type
             if (outProperty.PropertyType == inProperty.PropertyType)
             {
                 outProperty.SetValue(output, value);
                 continue;
-            }
-
-            // Nullable ↔ non nullable
+            } 
+            
             var targetType = Nullable.GetUnderlyingType(outProperty.PropertyType) ?? outProperty.PropertyType;
             var sourceType = Nullable.GetUnderlyingType(inProperty.PropertyType) ?? inProperty.PropertyType;
 
@@ -172,14 +185,14 @@ public class MegaMapper : IMegaMapper
             }
 
             // Convertible types
-            if (targetType.IsAssignableFrom(sourceType) || typeof(IConvertible).IsAssignableFrom(targetType))
+            if (IsAssignableOrConvertible(targetType, sourceType))
             {
                 outProperty.SetValue(output, Convert.ChangeType(value, targetType));
                 continue;
             }
 
-            // Recurring mapping if none of these
-            outProperty.SetValue(output, await Map(outProperty.PropertyType, value, mappedObjects));
+            var mapped = await Map(outProperty.PropertyType, value, mappedObjects);
+            outProperty.SetValue(output, mapped);
         }
 
         return output;
@@ -199,6 +212,30 @@ public class MegaMapper : IMegaMapper
     private static Dictionary<string, PropertyInfo> GetOrAddProperties(Type type)
     {
         return _propertiesCache.GetOrAdd(type, t =>
-            t.GetProperties().ToDictionary(prop => prop.Name.ToLower()));
+            t.GetProperties().ToDictionary(prop => prop.Name, StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static readonly Type ConvertibleType = typeof(IConvertible);
+
+    private static bool IsAssignableOrConvertible(Type targetType, Type sourceType)
+    {
+        var key = (targetType, sourceType);
+        if (_assignableCache.TryGetValue(key, out bool result))
+            return result;
+
+        if (targetType.IsAssignableFrom(sourceType))
+        {
+            _assignableCache[key] = true;
+            return true;
+        }
+        
+        if (!_convertibleCache.TryGetValue(targetType, out bool isConv))
+        {
+            isConv = ConvertibleType.IsAssignableFrom(targetType);
+            _convertibleCache[targetType] = isConv;
+        }
+
+        _assignableCache[key] = isConv;
+        return isConv;
     }
 }

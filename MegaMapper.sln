@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MegaMapper", "MegaMapper\Me
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MegaMapper.Tests", "MegaMapper.Tests\MegaMapper.Tests.csproj", "{005602D4-45B3-4587-9F61-241A5AE4FD74}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MegaMapper.PerformanceTest", "MegaMapper.PerformanceTest\MegaMapper.PerformanceTest.csproj", "{073CAF2A-538D-4FD9-976F-B0BACF2AF365}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -21,6 +23,10 @@ Global
 		{005602D4-45B3-4587-9F61-241A5AE4FD74}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{005602D4-45B3-4587-9F61-241A5AE4FD74}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{005602D4-45B3-4587-9F61-241A5AE4FD74}.Release|Any CPU.Build.0 = Release|Any CPU
+		{073CAF2A-538D-4FD9-976F-B0BACF2AF365}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{073CAF2A-538D-4FD9-976F-B0BACF2AF365}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{073CAF2A-538D-4FD9-976F-B0BACF2AF365}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{073CAF2A-538D-4FD9-976F-B0BACF2AF365}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
