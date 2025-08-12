@@ -34,9 +34,7 @@ public class MegaMapper : IMegaMapper
     private static readonly ConcurrentDictionary<Type, Func<object>> _ctorCache = new();
     private static readonly ConcurrentDictionary<(Type, Type), bool> _assignableCache = new();
     private static readonly ConcurrentDictionary<Type, bool> _convertibleCache = new();
-
-    // private static readonly Stopwatch _sw = new();
-    // private long _elapsed;
+    private static readonly ConcurrentDictionary<Type, Func<IList>> _listFactoryCache = new();
 
     private static object CreateInstance(Type type)
     {
@@ -80,7 +78,7 @@ public class MegaMapper : IMegaMapper
 
         if (mappedObjects.TryGetValue(input, out var existingMapped))
             return existingMapped;
-        
+
         if (_profiles.TryGetValue(new Tuple<Type, Type>(input.GetType(), outputType), out var matchedProfiles) && matchedProfiles.Count != 0)
         {
             var useBaseMap = matchedProfiles.Any(x => x.UseBaseMap);
@@ -100,7 +98,7 @@ public class MegaMapper : IMegaMapper
 
             return pass;
         }
-        
+
         if (_profiles.TryGetValue(new Tuple<Type, Type>(outputType, input.GetType()), out var inverseProfiles) && inverseProfiles.Count > 0)
         {
             var useBaseMap = inverseProfiles.Any(x => x.UseBaseMap);
@@ -129,16 +127,14 @@ public class MegaMapper : IMegaMapper
     {
         if (input == null)
             return null;
-        
-        var res3 = typeof(IEnumerable).IsAssignableFrom(outputType);
 
-        if (res3 && input is IEnumerable inputEnumerable)
+        if (typeof(IEnumerable).IsAssignableFrom(outputType) && input is IEnumerable inputEnumerable)
         {
             var outElementType = outputType.IsGenericType
                 ? outputType.GetGenericArguments()[0]
                 : typeof(object); // fallback if non generic
-
-            var resultList = (IList)CreateInstance(typeof(List<>).MakeGenericType(outElementType));
+            
+            var resultList = CreateListOfType(outElementType);
 
             foreach (var item in inputEnumerable)
             {
@@ -148,7 +144,7 @@ public class MegaMapper : IMegaMapper
 
             return resultList;
         }
-        
+
         var output = CreateInstance(outputType);
         mappedObjects[input] = output;
 
@@ -168,12 +164,14 @@ public class MegaMapper : IMegaMapper
                 outProperty.SetValue(output, null);
                 continue;
             }
+
+            // If same type
             if (outProperty.PropertyType == inProperty.PropertyType)
             {
                 outProperty.SetValue(output, value);
                 continue;
-            } 
-            
+            }
+            // Nullable ↔ non nullable
             var targetType = Nullable.GetUnderlyingType(outProperty.PropertyType) ?? outProperty.PropertyType;
             var sourceType = Nullable.GetUnderlyingType(inProperty.PropertyType) ?? inProperty.PropertyType;
 
@@ -191,6 +189,7 @@ public class MegaMapper : IMegaMapper
                 continue;
             }
 
+            // Recurring mapping if none of these
             var mapped = await Map(outProperty.PropertyType, value, mappedObjects);
             outProperty.SetValue(output, mapped);
         }
@@ -228,7 +227,7 @@ public class MegaMapper : IMegaMapper
             _assignableCache[key] = true;
             return true;
         }
-        
+
         if (!_convertibleCache.TryGetValue(targetType, out bool isConv))
         {
             isConv = ConvertibleType.IsAssignableFrom(targetType);
@@ -237,5 +236,19 @@ public class MegaMapper : IMegaMapper
 
         _assignableCache[key] = isConv;
         return isConv;
+    }
+
+
+    private static IList CreateListOfType(Type elementType)
+    {
+        return _listFactoryCache.GetOrAdd(elementType, t =>
+        {
+            var listType = typeof(List<>).MakeGenericType(t);
+            var ctor = listType.GetConstructor(Type.EmptyTypes)!;
+
+            var newExpr = Expression.New(ctor);
+            var lambda = Expression.Lambda<Func<IList>>(newExpr);
+            return lambda.Compile();
+        })();
     }
 }
