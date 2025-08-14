@@ -3,7 +3,7 @@
 public class PerformanceClass
 {
     public string Name { get; set; }
-    public List<PerformanceChild> Childs { get; set; }
+     public List<PerformanceChild> Childs { get; set; }
 }
 
 public class PerformanceChild

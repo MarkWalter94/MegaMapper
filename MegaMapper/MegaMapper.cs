@@ -28,18 +28,10 @@ public interface IMegaMapper
 
 public class MegaMapper : IMegaMapper
 {
-    // Cache for the properties of each type
     private static readonly ConcurrentDictionary<Type, Dictionary<string, PropertyInfo>> _propertiesCache = new();
     private readonly Dictionary<Tuple<Type, Type>, List<IMegaMapperProfile>> _profiles = new();
     private static readonly ConcurrentDictionary<Type, Func<object>> _ctorCache = new();
-    private static readonly ConcurrentDictionary<(Type, Type), bool> _assignableCache = new();
-    private static readonly ConcurrentDictionary<Type, bool> _convertibleCache = new();
-    private static readonly ConcurrentDictionary<Type, Func<IList>> _listFactoryCache = new();
-
-    private static object CreateInstance(Type type)
-    {
-        return _ctorCache.GetOrAdd(type, t => Expression.Lambda<Func<object>>(Expression.New(t)).Compile())();
-    }
+    private static readonly ConcurrentDictionary<(Type, Type), Func<object, Dictionary<object, object?>, object>> _compiledMaps = new();
 
     public MegaMapper(IEnumerable<IMegaMapperProfile> inputProfiles, IEnumerable<IMegaMapperMapBuilder> builders)
     {
@@ -48,207 +40,337 @@ public class MegaMapper : IMegaMapper
 
         foreach (var profile in profiles)
         {
-            if (_profiles.TryGetValue(new Tuple<Type, Type>(profile.GetTIn(), profile.GetTOut()), out var properties))
-                properties.Add(profile);
+            var key = Tuple.Create(profile.GetTIn(), profile.GetTOut());
+            if (_profiles.TryGetValue(key, out var list))
+                list.Add(profile);
             else
-                _profiles[new Tuple<Type, Type>(profile.GetTIn(), profile.GetTOut())] = [profile];
+                _profiles[key] = new List<IMegaMapperProfile> { profile };
         }
     }
 
-    public async Task<TOut> Map<TOut>(object input)
-    {
-        return (TOut)(await Map(typeof(TOut), input))!;
-    }
-
-    public async Task<TOut> Map<TIn, TOut>(TIn input)
-    {
-        return await Map<TOut>(input!);
-    }
+    public async Task<TOut> Map<TOut>(object input) => (TOut)(await Map(typeof(TOut), input))!;
+    public async Task<TOut> Map<TIn, TOut>(TIn input) => await Map<TOut>(input!);
 
     private async Task<object?> Map(Type outputType, object? input)
     {
         return await Map(outputType, input, new Dictionary<object, object?>(new ReferenceEqualityComparer()));
     }
 
-
     private async Task<object?> Map(Type outputType, object? input, Dictionary<object, object?> mappedObjects)
     {
-        if (input == null)
-            return null;
+        if (input == null) return null;
+        if (mappedObjects.TryGetValue(input, out var existing)) return existing;
 
-        if (mappedObjects.TryGetValue(input, out var existingMapped))
-            return existingMapped;
+        var inputType = input.GetType();
 
-        if (_profiles.TryGetValue(new Tuple<Type, Type>(input.GetType(), outputType), out var matchedProfiles) && matchedProfiles.Count != 0)
+        // Forward profiles
+        if (_profiles.TryGetValue(Tuple.Create(inputType, outputType), out var matchedProfiles) && matchedProfiles.Count > 0)
         {
-            var useBaseMap = matchedProfiles.Any(x => x.UseBaseMap);
-            object? pass = null;
-            if (useBaseMap)
-            {
-                pass = (await AutoMap(outputType, input, mappedObjects))!;
-            }
+            var pass = matchedProfiles.Any(x => x.UseBaseMap)
+                ? DeepMap(input, outputType, mappedObjects)
+                : CreateInstance(outputType);
 
-            foreach (var matchedProfile in matchedProfiles)
-            {
-                if (pass != null)
-                    pass = await matchedProfile.MapInternal(input, pass);
-                else
-                    pass = await matchedProfile.MapInternal(input);
-            }
+            foreach (var profile in matchedProfiles)
+                pass = await profile.MapInternal(input, pass);
 
             return pass;
         }
 
-        if (_profiles.TryGetValue(new Tuple<Type, Type>(outputType, input.GetType()), out var inverseProfiles) && inverseProfiles.Count > 0)
+        // Reverse profiles
+        if (_profiles.TryGetValue(Tuple.Create(outputType, inputType), out var inverseProfiles) && inverseProfiles.Count > 0)
         {
-            var useBaseMap = inverseProfiles.Any(x => x.UseBaseMap);
+            var pass = inverseProfiles.Any(x => x.UseBaseMap)
+                ? DeepMap(input, outputType, mappedObjects)
+                : CreateInstance(outputType);
 
-            object? pass = null;
-            if (useBaseMap)
-            {
-                pass = (await AutoMap(outputType, input, mappedObjects))!;
-            }
-
-            foreach (var inverseProfile in inverseProfiles)
-            {
-                if (pass != null)
-                    pass = await inverseProfile.MapBackInternal(input, pass);
-                else
-                    pass = await inverseProfile.MapBackInternal(input);
-            }
+            foreach (var profile in inverseProfiles)
+                pass = await profile.MapBackInternal(input, pass);
 
             return pass;
         }
 
-        return await AutoMap(outputType, input, mappedObjects);
+        // No profiles → generic deep map 
+        return DeepMap(input, outputType, mappedObjects);
     }
 
-    private async Task<object?> AutoMap(Type outputType, object? input, Dictionary<object, object?> mappedObjects)
+    /// <summary>
+    /// Maps “in depth” by compiling a lambda for (sourceType, targetType).
+    /// Supports: simple types via assign/convert, complex objects via property copy,
+    /// 1D arrays, jagged arrays ([][]…), and rectangular matrices (T[,], T[,,], …).
+    /// </summary>
+    private object DeepMap(object input, Type outputType, Dictionary<object, object?> mappedObjects)
     {
-        if (input == null)
-            return null;
-
-        if (typeof(IEnumerable).IsAssignableFrom(outputType) && input is IEnumerable inputEnumerable)
+        var func = _compiledMaps.GetOrAdd((input.GetType(), outputType), key =>
         {
-            var outElementType = outputType.IsGenericType
-                ? outputType.GetGenericArguments()[0]
-                : typeof(object); // fallback if non generic
-            
-            var resultList = CreateListOfType(outElementType);
+            var (sourceType, targetType) = key;
 
-            foreach (var item in inputEnumerable)
+            var srcParam = Expression.Parameter(typeof(object), "src");
+            var ctxParam = Expression.Parameter(typeof(Dictionary<object, object?>), "ctx");
+
+            var srcVar = Expression.Variable(sourceType, "typedSrc");
+            var tgtVar = Expression.Variable(targetType, "tgt");
+
+            var createInstanceMethod = typeof(MegaMapper)
+                .GetMethod(nameof(CreateInstance), BindingFlags.Static | BindingFlags.NonPublic)!;
+
+            // MethodInfos used in expressions
+            var dictAdd = typeof(Dictionary<object, object?>).GetMethod("Add")!;
+            var mapArrayMethod = typeof(MegaMapper).GetMethod(nameof(MapArray), BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+            var expressions = new List<Expression>
             {
-                var mappedItem = await Map(outElementType, item, mappedObjects);
-                resultList.Add(mappedItem);
+                // typedSrc = (TSource)src;
+                Expression.Assign(srcVar, Expression.Convert(srcParam, sourceType)),
+
+                // tgt = (TTarget)CreateInstance(targetType);
+                Expression.Assign(
+                    tgtVar,
+                    Expression.Convert(
+                        Expression.Call(createInstanceMethod, Expression.Constant(targetType)),
+                        targetType
+                    )
+                ),
+
+                // ctx.Add(src, tgt);
+                Expression.Call(ctxParam, dictAdd, srcParam, Expression.Convert(tgtVar, typeof(object)))
+            };
+
+            var srcProps = GetOrAddProperties(sourceType);
+            var tgtProps = GetOrAddProperties(targetType);
+
+            foreach (var sp in srcProps.Values)
+            {
+                if (!sp.CanRead) continue;
+                if (sp.GetIndexParameters().Length > 0) continue; // skip indicizzatori
+
+                if (!tgtProps.TryGetValue(sp.Name, out var tp) || !tp.CanWrite) continue;
+                if (tp.GetIndexParameters().Length > 0) continue; // skip indicizzatori
+
+                var srcPropExpr = Expression.Property(srcVar, sp);
+                var tgtPropExpr = Expression.Property(tgtVar, tp);
+
+                var sType = sp.PropertyType;
+                var tType = tp.PropertyType;
+
+                Expression assignExpression;
+
+                if (sType.IsArray && tType.IsArray)
+                {
+                    // Map Array → Array 
+                    assignExpression = Expression.Assign(
+                        tgtPropExpr,
+                        Expression.Convert(
+                            Expression.Call(
+                                Expression.Constant(this),
+                                mapArrayMethod,
+                                Expression.Convert(srcPropExpr, typeof(Array)),
+                                Expression.Constant(tType),
+                                ctxParam
+                            ),
+                            tType
+                        )
+                    );
+                }
+                else if (typeof(IEnumerable).IsAssignableFrom(sType) && typeof(IEnumerable).IsAssignableFrom(tType) 
+                                                                     && sType != typeof(string) && tType != typeof(string))
+                {
+                    // Map Enumerable → Enumerable
+                    var mapEnumerableMethod = typeof(MegaMapper).GetMethod(
+                        nameof(MapEnumerable),
+                        BindingFlags.NonPublic | BindingFlags.Instance
+                    )!;
+
+                    assignExpression = Expression.Assign(
+                        tgtPropExpr,
+                        Expression.Convert(
+                            Expression.Call(
+                                Expression.Constant(this),
+                                mapEnumerableMethod,
+                                Expression.Convert(srcPropExpr, typeof(object)),
+                                Expression.Constant(tType),
+                                ctxParam
+                            ),
+                            tType
+                        )
+                    );
+                }
+                else
+                {
+                    // Simple map
+                    assignExpression = Expression.Assign(
+                        tgtPropExpr,
+                        Expression.Convert(srcPropExpr, tType)
+                    );
+                }
+                expressions.Add(
+                    // if (src.Prop != null) { ... }  (solo per reference type)
+                    sType.IsValueType
+                        ? assignExpression
+                        : Expression.IfThen(
+                            Expression.NotEqual(srcPropExpr, Expression.Constant(null, sType)),
+                            assignExpression
+                          )
+                );
             }
 
-            return resultList;
+            expressions.Add(tgtVar);
+
+            var body = Expression.Block(new[] { srcVar, tgtVar }, expressions);
+            return Expression.Lambda<Func<object, Dictionary<object, object?>, object>>(body, srcParam, ctxParam).Compile();
+        });
+
+        var result = func(input, mappedObjects);
+        mappedObjects[input] = result;
+        return result;
+    }
+    
+    private object? MapEnumerable(object? sourceEnumerable, Type targetEnumerableType, Dictionary<object, object?> ctx)
+    {
+        if (sourceEnumerable == null) return null;
+
+        var srcEnum = ((IEnumerable)sourceEnumerable).Cast<object>();
+        var dest = (IList)Activator.CreateInstance(targetEnumerableType)!;
+
+        var targetElementType = targetEnumerableType.IsGenericType
+            ? targetEnumerableType.GetGenericArguments()[0]
+            : typeof(object);
+
+        foreach (var item in srcEnum)
+        {
+            object? mappedElem;
+            if (item == null)
+            {
+                mappedElem = null;
+            }
+            else if (typeof(IEnumerable).IsAssignableFrom(targetElementType) && targetElementType != typeof(string))
+            {
+                // sublist → recursion
+                mappedElem = MapEnumerable(item, targetElementType, ctx);
+            }
+            else
+            {
+                // simple type
+                mappedElem = DeepMap(item, targetElementType, ctx);
+            }
+
+            dest.Add(mappedElem);
         }
 
-        var output = CreateInstance(outputType);
-        mappedObjects[input] = output;
+        return dest;
+    }
 
-        var inputProperties = GetOrAddProperties(input.GetType());
-        var outputProperties = GetOrAddProperties(outputType);
 
-        foreach (var inProperty in inputProperties.Values)
+
+    /// <summary>
+    /// Maps a source array (including multi-dimensional arrays) to an array of the destination type.
+    /// Supports: 1D, jagged ([][]... recursive), and rectangular (Rank > 1).
+    /// </summary>
+    private object? MapArray(Array? sourceArray, Type targetArrayType, Dictionary<object, object?> ctx)
+    {
+        if (sourceArray is null) return null;
+
+        var targetElementType = targetArrayType.GetElementType()!;
+        var rank = sourceArray.Rank;
+
+        if (rank == 1)
         {
-            if (!inProperty.CanRead) continue;
-            if (!outputProperties.TryGetValue(inProperty.Name, out var outProperty)) continue;
-            if (!outProperty.CanWrite) continue;
+            var len = sourceArray.Length;
+            var dest = Array.CreateInstance(targetElementType, len);
 
-            var value = inProperty.GetValue(input);
-
-            if (value == null)
+            for (int i = 0; i < len; i++)
             {
-                outProperty.SetValue(output, null);
-                continue;
+                var srcElem = sourceArray.GetValue(i);
+                object? mappedElem;
+
+                if (srcElem is null)
+                {
+                    mappedElem = null;
+                }
+                else if (srcElem is Array innerSrc && targetElementType.IsArray)
+                {
+                    // Jagged: element is itself an array → recursive
+                    mappedElem = MapArray(innerSrc, targetElementType, ctx);
+                }
+                else
+                {
+                    // “Normal” element: deep map to the destination element type
+                    mappedElem = DeepMap(srcElem, targetElementType, ctx);
+                }
+
+                dest.SetValue(mappedElem, i);
             }
 
-            // If same type
-            if (outProperty.PropertyType == inProperty.PropertyType)
-            {
-                outProperty.SetValue(output, value);
-                continue;
-            }
-            // Nullable ↔ non nullable
-            var targetType = Nullable.GetUnderlyingType(outProperty.PropertyType) ?? outProperty.PropertyType;
-            var sourceType = Nullable.GetUnderlyingType(inProperty.PropertyType) ?? inProperty.PropertyType;
-
-            if (targetType == sourceType)
-            {
-                // Same underlying type
-                outProperty.SetValue(output, Convert.ChangeType(value, targetType));
-                continue;
-            }
-
-            // Convertible types
-            if (IsAssignableOrConvertible(targetType, sourceType))
-            {
-                outProperty.SetValue(output, Convert.ChangeType(value, targetType));
-                continue;
-            }
-
-            // Recurring mapping if none of these
-            var mapped = await Map(outProperty.PropertyType, value, mappedObjects);
-            outProperty.SetValue(output, mapped);
+            return dest;
         }
+        else
+        {
+            // Rectangular: T[,], T[,,], ...
+            var lengths = Enumerable.Range(0, rank).Select(d => sourceArray.GetLength(d)).ToArray();
+            var dest = Array.CreateInstance(targetElementType, lengths);
 
-        return output;
+            // Iterate through all indexes with a vector counter
+            var indices = new int[rank];
+            var done = false;
+
+            while (!done)
+            {
+                var srcElem = sourceArray.GetValue(indices);
+                object? mappedElem;
+
+                if (srcElem is null)
+                {
+                    mappedElem = null;
+                }
+                else if (srcElem is Array inner && targetElementType.IsArray)
+                {
+                    mappedElem = MapArray(inner, targetElementType, ctx);
+                }
+                else
+                {
+                    mappedElem = DeepMap(srcElem, targetElementType, ctx);
+                }
+
+                dest.SetValue(mappedElem, indices);
+
+// Increases the index vector
+for (int dim = rank - 1; dim >= 0; dim--)
+                {
+                    indices[dim]++;
+                    if (indices[dim] < lengths[dim])
+                    {
+                        break; 
+                    }
+                    else
+                    {
+                        indices[dim] = 0;
+                        if (dim == 0) done = true;
+                    }
+                }
+            }
+
+            return dest;
+        }
+    }
+
+    private static object CreateInstance(Type type)
+    {
+        return _ctorCache.GetOrAdd(type, t =>
+            Expression.Lambda<Func<object>>(Expression.New(t)).Compile()
+        )();
+    }
+
+    private static Dictionary<string, PropertyInfo> GetOrAddProperties(Type type)
+    {
+        // NB: we do not filter the indexers here in order to have a “complete” cache;
+        // we skip them in the expression build cycle.
+        return _propertiesCache.GetOrAdd(type, t =>
+            t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+             .ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase));
     }
 
     private class ReferenceEqualityComparer : IEqualityComparer<object>
     {
-        bool IEqualityComparer<object>.Equals(object? x, object? y) => ReferenceEquals(x, y);
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
         public int GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
-    }
-
-    /// <summary>
-    /// Get or add cached properties references.
-    /// </summary>
-    /// <param name="type"></param>
-    /// <returns></returns>
-    private static Dictionary<string, PropertyInfo> GetOrAddProperties(Type type)
-    {
-        return _propertiesCache.GetOrAdd(type, t =>
-            t.GetProperties().ToDictionary(prop => prop.Name, StringComparer.OrdinalIgnoreCase));
-    }
-
-    private static readonly Type ConvertibleType = typeof(IConvertible);
-
-    private static bool IsAssignableOrConvertible(Type targetType, Type sourceType)
-    {
-        var key = (targetType, sourceType);
-        if (_assignableCache.TryGetValue(key, out bool result))
-            return result;
-
-        if (targetType.IsAssignableFrom(sourceType))
-        {
-            _assignableCache[key] = true;
-            return true;
-        }
-
-        if (!_convertibleCache.TryGetValue(targetType, out bool isConv))
-        {
-            isConv = ConvertibleType.IsAssignableFrom(targetType);
-            _convertibleCache[targetType] = isConv;
-        }
-
-        _assignableCache[key] = isConv;
-        return isConv;
-    }
-
-
-    private static IList CreateListOfType(Type elementType)
-    {
-        return _listFactoryCache.GetOrAdd(elementType, t =>
-        {
-            var listType = typeof(List<>).MakeGenericType(t);
-            var ctor = listType.GetConstructor(Type.EmptyTypes)!;
-
-            var newExpr = Expression.New(ctor);
-            var lambda = Expression.Lambda<Func<IList>>(newExpr);
-            return lambda.Compile();
-        })();
     }
 }
