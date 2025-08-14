@@ -100,7 +100,16 @@ public class MegaMapper : IMegaMapper
     /// </summary>
     private object DeepMap(object input, Type outputType, Dictionary<object, object?> mappedObjects)
     {
-        var func = _compiledMaps.GetOrAdd((input.GetType(), outputType), key =>
+        if (mappedObjects.TryGetValue(input, out var existing))
+            return existing!;
+
+        var inputType = input.GetType();
+
+        // Create instance to avoid loops..
+        var instance = CreateInstance(outputType);
+        mappedObjects[input] = instance;
+
+        var func = _compiledMaps.GetOrAdd((inputType, outputType), key =>
         {
             var (sourceType, targetType) = key;
 
@@ -110,41 +119,37 @@ public class MegaMapper : IMegaMapper
             var srcVar = Expression.Variable(sourceType, "typedSrc");
             var tgtVar = Expression.Variable(targetType, "tgt");
 
-            var createInstanceMethod = typeof(MegaMapper)
-                .GetMethod(nameof(CreateInstance), BindingFlags.Static | BindingFlags.NonPublic)!;
+            var expressions = new List<Expression>();
 
-            // MethodInfos used in expressions
-            var dictAdd = typeof(Dictionary<object, object?>).GetMethod("Add")!;
-            var mapArrayMethod = typeof(MegaMapper).GetMethod(nameof(MapArray), BindingFlags.NonPublic | BindingFlags.Instance)!;
+            // typedSrc = (TSource)src;
+            expressions.Add(Expression.Assign(srcVar, Expression.Convert(srcParam, sourceType)));
 
-            var expressions = new List<Expression>
-            {
-                // typedSrc = (TSource)src;
-                Expression.Assign(srcVar, Expression.Convert(srcParam, sourceType)),
+            // tgt = (TTarget)CreateInstance(targetType);
+            expressions.Add(Expression.Assign(
+                tgtVar,
+                Expression.Convert(
+                    Expression.Call(typeof(MegaMapper)
+                            .GetMethod(nameof(CreateInstance), BindingFlags.Static | BindingFlags.NonPublic)!,
+                        Expression.Constant(targetType)
+                    ),
+                    targetType
+                )
+            ));
 
-                // tgt = (TTarget)CreateInstance(targetType);
-                Expression.Assign(
-                    tgtVar,
-                    Expression.Convert(
-                        Expression.Call(createInstanceMethod, Expression.Constant(targetType)),
-                        targetType
-                    )
-                ),
-
-                // ctx.Add(src, tgt);
-                Expression.Call(ctxParam, dictAdd, srcParam, Expression.Convert(tgtVar, typeof(object)))
-            };
+            // ctx[src] = tgt;
+            var dictIndexer = typeof(Dictionary<object, object?>).GetProperty("Item");
+            expressions.Add(Expression.Assign(
+                Expression.Property(ctxParam, dictIndexer!, Expression.Convert(srcVar, typeof(object))),
+                Expression.Convert(tgtVar, typeof(object))
+            ));
 
             var srcProps = GetOrAddProperties(sourceType);
             var tgtProps = GetOrAddProperties(targetType);
 
             foreach (var sp in srcProps.Values)
             {
-                if (!sp.CanRead) continue;
-                if (sp.GetIndexParameters().Length > 0) continue; // skip indicizzatori
-
-                if (!tgtProps.TryGetValue(sp.Name, out var tp) || !tp.CanWrite) continue;
-                if (tp.GetIndexParameters().Length > 0) continue; // skip indicizzatori
+                if (!sp.CanRead || sp.GetIndexParameters().Length > 0) continue;
+                if (!tgtProps.TryGetValue(sp.Name, out var tp) || !tp.CanWrite || tp.GetIndexParameters().Length > 0) continue;
 
                 var srcPropExpr = Expression.Property(srcVar, sp);
                 var tgtPropExpr = Expression.Property(tgtVar, tp);
@@ -156,13 +161,12 @@ public class MegaMapper : IMegaMapper
 
                 if (sType.IsArray && tType.IsArray)
                 {
-                    // Map Array → Array 
                     assignExpression = Expression.Assign(
                         tgtPropExpr,
                         Expression.Convert(
                             Expression.Call(
                                 Expression.Constant(this),
-                                mapArrayMethod,
+                                typeof(MegaMapper).GetMethod(nameof(MapArray), BindingFlags.NonPublic | BindingFlags.Instance)!,
                                 Expression.Convert(srcPropExpr, typeof(Array)),
                                 Expression.Constant(tType),
                                 ctxParam
@@ -171,21 +175,32 @@ public class MegaMapper : IMegaMapper
                         )
                     );
                 }
-                else if (typeof(IEnumerable).IsAssignableFrom(sType) && typeof(IEnumerable).IsAssignableFrom(tType) 
+                else if (typeof(IEnumerable).IsAssignableFrom(sType) && typeof(IEnumerable).IsAssignableFrom(tType)
                                                                      && sType != typeof(string) && tType != typeof(string))
                 {
-                    // Map Enumerable → Enumerable
-                    var mapEnumerableMethod = typeof(MegaMapper).GetMethod(
-                        nameof(MapEnumerable),
-                        BindingFlags.NonPublic | BindingFlags.Instance
-                    )!;
-
                     assignExpression = Expression.Assign(
                         tgtPropExpr,
                         Expression.Convert(
                             Expression.Call(
                                 Expression.Constant(this),
-                                mapEnumerableMethod,
+                                typeof(MegaMapper).GetMethod(nameof(MapEnumerable), BindingFlags.NonPublic | BindingFlags.Instance)!,
+                                Expression.Convert(srcPropExpr, typeof(object)),
+                                Expression.Constant(tType),
+                                ctxParam
+                            ),
+                            tType
+                        )
+                    );
+                }
+                else if (sType != tType && !sType.IsValueType && !tType.IsValueType &&
+                         sType != typeof(string) && tType != typeof(string))
+                {
+                    assignExpression = Expression.Assign(
+                        tgtPropExpr,
+                        Expression.Convert(
+                            Expression.Call(
+                                Expression.Constant(this),
+                                typeof(MegaMapper).GetMethod(nameof(DeepMap), BindingFlags.NonPublic | BindingFlags.Instance)!,
                                 Expression.Convert(srcPropExpr, typeof(object)),
                                 Expression.Constant(tType),
                                 ctxParam
@@ -196,20 +211,16 @@ public class MegaMapper : IMegaMapper
                 }
                 else
                 {
-                    // Simple map
-                    assignExpression = Expression.Assign(
-                        tgtPropExpr,
-                        Expression.Convert(srcPropExpr, tType)
-                    );
+                    assignExpression = Expression.Assign(tgtPropExpr, Expression.Convert(srcPropExpr, tType));
                 }
+
                 expressions.Add(
-                    // if (src.Prop != null) { ... }  (solo per reference type)
                     sType.IsValueType
                         ? assignExpression
                         : Expression.IfThen(
                             Expression.NotEqual(srcPropExpr, Expression.Constant(null, sType)),
                             assignExpression
-                          )
+                        )
                 );
             }
 
@@ -219,11 +230,9 @@ public class MegaMapper : IMegaMapper
             return Expression.Lambda<Func<object, Dictionary<object, object?>, object>>(body, srcParam, ctxParam).Compile();
         });
 
-        var result = func(input, mappedObjects);
-        mappedObjects[input] = result;
-        return result;
+        return func(input, mappedObjects);
     }
-    
+
     private object? MapEnumerable(object? sourceEnumerable, Type targetEnumerableType, Dictionary<object, object?> ctx)
     {
         if (sourceEnumerable == null) return null;
@@ -258,7 +267,6 @@ public class MegaMapper : IMegaMapper
 
         return dest;
     }
-
 
 
     /// <summary>
@@ -333,12 +341,12 @@ public class MegaMapper : IMegaMapper
                 dest.SetValue(mappedElem, indices);
 
 // Increases the index vector
-for (int dim = rank - 1; dim >= 0; dim--)
+                for (int dim = rank - 1; dim >= 0; dim--)
                 {
                     indices[dim]++;
                     if (indices[dim] < lengths[dim])
                     {
-                        break; 
+                        break;
                     }
                     else
                     {
@@ -365,7 +373,7 @@ for (int dim = rank - 1; dim >= 0; dim--)
         // we skip them in the expression build cycle.
         return _propertiesCache.GetOrAdd(type, t =>
             t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-             .ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase));
+                .ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase));
     }
 
     private class ReferenceEqualityComparer : IEqualityComparer<object>
